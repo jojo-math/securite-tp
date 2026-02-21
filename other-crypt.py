@@ -1,9 +1,20 @@
 import math
 import random
+import unicodedata
+from collections import Counter
+import re
 
 # --- CONFIGURATION ---
 ALPHABET = 'àâäæçéèêëîïôöùûüÿœÀÂÄÆÇÉÈÊËÎÏÔÖÙÛÜŸŒ0123456789²& é"(-è_çà)=~{[|^@]}€¤£µ*ù%!§:/;.,?<>+°¨$£¥¢©®™✓✔✕✖¶§±÷×≈≠≤≥∞√∑πΩαβγδεζηθικλμνξοπρστυφχψωABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz#\''
 N = len(ALPHABET)
+CHAR_TO_INDEX = {char: idx for idx, char in enumerate(ALPHABET)}
+VALID_A_VALUES = [a for a in range(1, N) if math.gcd(a, N) == 1]
+WORD_PATTERN = re.compile(r"[^\W\d_]+", flags=re.UNICODE)
+COMMON_WORDS = {"le", "la", "les", "des", "une", "dans", "est", "pas", "pour", "que", "qui", "sur", "de", "et"}
+FREQUENT_CLEAR_CHARS = [
+    char for char in " eaistnrulodcmpvqfbghjxykzwETAOINSHRDLU"
+    if char in CHAR_TO_INDEX
+]
 
 # --- OUTILS MATHÉMATIQUES ---
 
@@ -52,23 +63,96 @@ def dechiffrement(texte_code, a, b):
             resultat += char
     return resultat
 
+def _normaliser_mot(mot):
+    decomposed = unicodedata.normalize('NFKD', mot.casefold())
+    return ''.join(char for char in decomposed if not unicodedata.combining(char))
+
+def _score_texte(texte):
+    if not texte:
+        return float('-inf')
+
+    categories = Counter(unicodedata.category(char)[0] for char in texte)
+    score = 0.0
+    score += categories.get('L', 0) * 2.8
+    score += categories.get('Z', 0) * 2.0
+    score += categories.get('P', 0) * 1.0
+    score -= categories.get('S', 0) * 1.5
+    score -= categories.get('C', 0) * 4.0
+
+    mots = [_normaliser_mot(mot) for mot in WORD_PATTERN.findall(texte) if len(mot) >= 2]
+    if mots:
+        hits = sum(1 for mot in mots if mot in COMMON_WORDS)
+        score += (hits / len(mots)) * 300.0
+
+    return score
+
+def _resoudre_lineaire_modulaire(coef, rhs, modulo):
+    g = math.gcd(coef, modulo)
+    if rhs % g != 0:
+        return []
+
+    coef_reduit = coef // g
+    rhs_reduit = rhs // g
+    modulo_reduit = modulo // g
+    inv = pow(coef_reduit, -1, modulo_reduit)
+    x0 = (inv * rhs_reduit) % modulo_reduit
+    return [(x0 + k * modulo_reduit) % modulo for k in range(g)]
+
+def _indices_plus_frequents(texte, limite=10):
+    compteur = Counter(char for char in texte if char in CHAR_TO_INDEX)
+    return [CHAR_TO_INDEX[char] for char, _ in compteur.most_common(limite)]
+
+def _generer_cles_par_frequences(texte_code, max_cipher_chars=12, max_plain_chars=12):
+    indices_cipher = _indices_plus_frequents(texte_code, limite=max_cipher_chars)
+    indices_plain = [CHAR_TO_INDEX[char] for char in FREQUENT_CLEAR_CHARS[:max_plain_chars]]
+
+    cles = set()
+    for i, c1 in enumerate(indices_cipher):
+        for c2 in indices_cipher[i + 1:]:
+            delta_c = (c1 - c2) % N
+            for j, p1 in enumerate(indices_plain):
+                for p2 in indices_plain[j + 1:]:
+                    delta_p = (p1 - p2) % N
+                    if delta_p == 0:
+                        continue
+                    for a in _resoudre_lineaire_modulaire(delta_p, delta_c, N):
+                        if math.gcd(a, N) != 1:
+                            continue
+                        b = (c1 - a * p1) % N
+                        cles.add((a, b))
+    return list(cles)
+
 def cryptanalyse_brute_force(texte_code):
-    """Opération 4 : Cryptanalyse par force brute."""
-    print("\n[Recherche en cours...]")
-    mots_cles = [" le ", " la ", " est ", " de ", " un "] # Pour détecter le français
-    
-    for a in range(1, N):
-        if math.gcd(a, N) == 1:
-            for b in range(N):
-                test = dechiffrement(texte_code, a, b)
-                # On vérifie si un mot commun apparaît
-                if any(mot in test for mot in mots_cles):
-                    print(f" Clé potentielle trouvée : a={a}, b={b}")
-                    print(f" Texte : {test[:100]}...")
-                    reponse = input("Est-ce correct ? (o/n) : ")
-                    if reponse.lower() == 'o':
-                        return test
-    print("Aucun résultat probant trouvé.")
+    """Opération 4 : Cryptanalyse affine guidée par fréquences."""
+    print("\n[Analyse fréquentielle + brute-force en cours...]")
+
+    cles_freq = _generer_cles_par_frequences(texte_code)
+    print(f"Candidats fréquentiels: {len(cles_freq)}")
+
+    if len(cles_freq) < 10:
+        cles = cles_freq + [(a, b) for a in VALID_A_VALUES for b in range(N) if (a, b) not in set(cles_freq)]
+    else:
+        cles = cles_freq
+
+    meilleurs = []
+    for a, b in cles:
+        test = dechiffrement(texte_code, a, b)
+        score = _score_texte(test)
+        meilleurs.append((score, a, b, test))
+
+    meilleurs.sort(reverse=True, key=lambda x: x[0])
+    top = meilleurs[:10]
+
+    for i, (score, a, b, texte) in enumerate(top, 1):
+        print(f"\n--- Résultat {i} ---")
+        print(f"Clé: a={a}, b={b} (score={score:.2f})")
+        print(f"Texte: {texte[:140]}...")
+
+    if not top:
+        print("Aucun résultat probant trouvé.")
+        return None
+
+    return top[0][3]
 
 # --- MENU PRINCIPAL ---
 

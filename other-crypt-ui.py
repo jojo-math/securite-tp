@@ -28,7 +28,10 @@ COMMON_WORDS = {
     "een", "van", "met", "niet", "voor", "het", "dat", "zijn", "was", "maar", "ook", "naar",
 }
 WORD_PATTERN = re.compile(r"[^\W\d_]+", flags=re.UNICODE)
-RAINBOW_CACHE = {}
+FREQUENT_CLEAR_CHARS = [
+    char for char in " eaistnrulodcmpvqfbghjxykzwETAOINSHRDLU"
+    if char in CHAR_TO_INDEX
+]
 
 # --- FONCTIONS MATHÉMATIQUES ---
 
@@ -137,43 +140,46 @@ def _chunks(sequence, taille):
     for i in range(0, len(sequence), taille):
         yield sequence[i:i + taille]
 
-def _worker_rainbow(chunk_cles, echantillon_texte, echantillon_indices):
-    """Worker: construit des stats de table arc-en-ciel sur un sous-ensemble de clés."""
-    local_entries = []
-    for a, b in chunk_cles:
-        texte_test = _dechiffrement_depuis_indices(echantillon_indices, echantillon_texte, A_INVERSES[a], b)
-        score_stats = _score_texte_universel(texte_test)
-        score_dict = _score_dictionnaire(texte_test)
-        local_entries.append((a, b, score_stats, score_dict))
-    return local_entries
+def _resoudre_lineaire_modulaire(coef, rhs, modulo):
+    """Résout coef * x = rhs (mod modulo) et renvoie toutes les solutions."""
+    g = math.gcd(coef, modulo)
+    if rhs % g != 0:
+        return []
 
-def _construire_table_arc_en_ciel(texte_code, taille_echantillon):
-    """Construit/cache une table arc-en-ciel simplifiée (clé -> scores d'empreinte)."""
-    signature = texte_code[:taille_echantillon]
-    cache_key = (signature, taille_echantillon)
-    if cache_key in RAINBOW_CACHE:
-        return RAINBOW_CACHE[cache_key]
+    coef_reduit = coef // g
+    rhs_reduit = rhs // g
+    modulo_reduit = modulo // g
+    inv = pow(coef_reduit, -1, modulo_reduit)
+    x0 = (inv * rhs_reduit) % modulo_reduit
+    return [(x0 + k * modulo_reduit) % modulo for k in range(g)]
 
-    echantillon_texte = signature
-    echantillon_indices = [CHAR_TO_INDEX.get(char) for char in echantillon_texte]
+def _indices_plus_frequents(texte, limite=10):
+    """Renvoie les indices des caractères les plus fréquents du texte chiffré."""
+    compteur = Counter(char for char in texte if char in CHAR_TO_INDEX)
+    return [CHAR_TO_INDEX[char] for char, _ in compteur.most_common(limite)]
 
-    nb_workers = max(1, min(MAX_WORKERS, len(KEY_SPACE)))
-    taille_bloc = max(1, len(KEY_SPACE) // nb_workers)
+def _generer_cles_par_frequences(texte_code, max_cipher_chars=12, max_plain_chars=12):
+    """Génère des clés candidates via hypothèses fréquentielles (méthode des 2 équations)."""
+    indices_cipher = _indices_plus_frequents(texte_code, limite=max_cipher_chars)
+    indices_plain = [CHAR_TO_INDEX[char] for char in FREQUENT_CLEAR_CHARS[:max_plain_chars]]
 
-    table = {}
-    with ThreadPoolExecutor(max_workers=nb_workers) as executor:
-        futures = [
-            executor.submit(_worker_rainbow, chunk, echantillon_texte, echantillon_indices)
-            for chunk in _chunks(KEY_SPACE, taille_bloc)
-        ]
-        for future in futures:
-            for a, b, score_stats, score_dict in future.result():
-                table[(a, b)] = (score_stats, score_dict)
+    cles = set()
+    for i, c1 in enumerate(indices_cipher):
+        for c2 in indices_cipher[i + 1:]:
+            delta_c = (c1 - c2) % N
+            for j, p1 in enumerate(indices_plain):
+                for p2 in indices_plain[j + 1:]:
+                    delta_p = (p1 - p2) % N
+                    if delta_p == 0:
+                        continue
 
-    if len(RAINBOW_CACHE) > 8:
-        RAINBOW_CACHE.pop(next(iter(RAINBOW_CACHE)))
-    RAINBOW_CACHE[cache_key] = table
-    return table
+                    for a in _resoudre_lineaire_modulaire(delta_p, delta_c, N):
+                        if math.gcd(a, N) != 1 or a not in A_INVERSES:
+                            continue
+                        b = (c1 - a * p1) % N
+                        cles.add((a, b))
+
+    return list(cles)
 
 def _worker_evaluer_cles(chunk_cles, texte_code, indices):
     """Worker: évalue les clés candidates sur le texte complet."""
@@ -185,29 +191,23 @@ def _worker_evaluer_cles(chunk_cles, texte_code, indices):
     return resultats
 
 def cryptanalyse_brute_force(texte_code, callback=None, max_resultats=10):
-    """Cryptanalyse hybride: dictionnaire + table arc-en-ciel + calcul parallèle."""
+    """Cryptanalyse affine guidée par fréquences, avec repli en brute-force."""
     if not texte_code:
         return []
 
     indices = [CHAR_TO_INDEX.get(char) for char in texte_code]
-    taille_echantillon = min(len(texte_code), 120)
-
-    rainbow_table = _construire_table_arc_en_ciel(texte_code, taille_echantillon)
+    cles_freq = _generer_cles_par_frequences(texte_code)
 
     if callback:
-        callback("Table arc-en-ciel prête.")
+        callback(f"Hypothèses fréquentielles: {len(cles_freq)} clés candidates.")
 
-    preselection = []
-    for (a, b), (score_stats, score_dict) in rainbow_table.items():
-        score_pre = score_stats + 2.2 * score_dict
-        preselection.append((score_pre, a, b))
-
-    nb_candidats = len(preselection)
-    meilleurs_candidats = heapq.nlargest(nb_candidats, preselection, key=lambda x: x[0])
-    cles_candidates = [(a, b) for _, a, b in meilleurs_candidats]
-
-    if callback:
-        callback(f"{len(cles_candidates)} clés candidates à tester.")
+    if len(cles_freq) < max_resultats * 2:
+        deja = set(cles_freq)
+        cles_candidates = cles_freq + [cle for cle in KEY_SPACE if cle not in deja]
+        if callback:
+            callback("Pas assez de candidats fréquentiels: repli sur brute-force complète.")
+    else:
+        cles_candidates = cles_freq
 
     nb_workers = max(1, min(MAX_WORKERS, len(cles_candidates)))
     taille_bloc = max(1, len(cles_candidates) // nb_workers)
