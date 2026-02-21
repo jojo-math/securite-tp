@@ -2,10 +2,33 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import math
 import random
+import unicodedata
+from collections import Counter
+import heapq
+import re
+from concurrent.futures import ThreadPoolExecutor
 
 # --- CONFIGURATION ---
 ALPHABET = 'àâäæçéèêëîïôöùûüÿœÀÂÄÆÇÉÈÊËÎÏÔÖÙÛÜŸŒ0123456789²& é"(-è_çà)=~{[|^@]}€¤£µ*ù%!§:/;.,?<>+°¨$£¥¢©®™✓✔✕✖¶§±÷×≈≠≤≥∞√∑πΩαβγδεζηθικλμνξοπρστυφχψωABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz#\''
+ALPHABET = ''.join(dict.fromkeys(ALPHABET))
 N = len(ALPHABET)
+CHAR_TO_INDEX = {char: idx for idx, char in enumerate(ALPHABET)}
+VALID_A_VALUES = [a for a in range(1, N) if math.gcd(a, N) == 1]
+A_INVERSES = {a: inverse for a in VALID_A_VALUES if (inverse := pow(a, -1, N)) is not None}
+KEY_SPACE = [(a, b) for a in VALID_A_VALUES for b in range(N)]
+MAX_WORKERS = 8
+
+COMMON_WORDS = {
+    "the", "and", "for", "with", "this", "that", "you", "are", "was", "from", "have", "not",
+    "le", "la", "les", "des", "une", "dans", "est", "pas", "pour", "que", "qui", "sur",
+    "de", "del", "los", "las", "una", "para", "con", "por", "que", "como", "pero", "sus",
+    "der", "die", "das", "und", "ist", "nicht", "mit", "ein", "eine", "auf", "von", "den",
+    "il", "lo", "gli", "una", "con", "per", "che", "non", "nel", "della", "sono", "come",
+    "uma", "com", "para", "que", "não", "dos", "das", "por", "mais", "como", "seus", "tem",
+    "een", "van", "met", "niet", "voor", "het", "dat", "zijn", "was", "maar", "ook", "naar",
+}
+WORD_PATTERN = re.compile(r"[^\W\d_]+", flags=re.UNICODE)
+RAINBOW_CACHE = {}
 
 # --- FONCTIONS MATHÉMATIQUES ---
 
@@ -32,8 +55,8 @@ def chiffrement(texte, a, b):
     """Chiffrement."""
     resultat = ""
     for char in texte:
-        if char in ALPHABET:
-            x = ALPHABET.index(char)
+        x = CHAR_TO_INDEX.get(char)
+        if x is not None:
             resultat += ALPHABET[(a * x + b) % N]
         else:
             resultat += char
@@ -45,27 +68,164 @@ def dechiffrement(texte_code, a, b):
     if a_inv is None: return None
     resultat = ""
     for char in texte_code:
-        if char in ALPHABET:
-            y = ALPHABET.index(char)
+        y = CHAR_TO_INDEX.get(char)
+        if y is not None:
             resultat += ALPHABET[(a_inv * (y - b)) % N]
         else:
             resultat += char
     return resultat
 
-def cryptanalyse_brute_force(texte_code, callback):
-    """Cryptanalyse par force brute."""
-    mots_cles = [" le ", " la ", " est ", " de ", " un "]
+def _score_texte_universel(texte):
+    """Score agnostique à la langue basé sur des propriétés statistiques du texte."""
+    if not texte:
+        return float('-inf')
+
+    taille = len(texte)
+    compte_categories = Counter(unicodedata.category(char)[0] for char in texte)
+
+    score = 0.0
+    score += compte_categories.get('L', 0) * 3.0   # Lettres (toutes langues)
+    score += compte_categories.get('N', 0) * 2.0   # Chiffres
+    score += compte_categories.get('P', 0) * 1.0   # Ponctuation
+    score += compte_categories.get('Z', 0) * 2.0   # Espaces/séparateurs
+    score -= compte_categories.get('S', 0) * 1.5   # Symboles math/currency/etc
+    score -= compte_categories.get('C', 0) * 4.0   # Contrôles/non imprimables
+
+    freqs = Counter(texte)
+    unicite = len(freqs) / taille
+    score += (1.0 - unicite) * 50.0
+
+    if taille > 1:
+        ic = sum(freq * (freq - 1) for freq in freqs.values()) / (taille * (taille - 1))
+        score += ic * 2000.0
+
+    return score
+
+def _normaliser_mot(mot):
+    """Normalise un mot pour le matching dictionnaire (agnostique accents/casse)."""
+    decomposed = unicodedata.normalize('NFKD', mot.casefold())
+    return ''.join(char for char in decomposed if not unicodedata.combining(char))
+
+def _extraire_mots(texte):
+    """Extrait les mots Unicode d'un texte."""
+    return [_normaliser_mot(mot) for mot in WORD_PATTERN.findall(texte)]
+
+def _score_dictionnaire(texte):
+    """Score basé sur présence de mots fréquents multi-langues."""
+    mots = [mot for mot in _extraire_mots(texte) if len(mot) >= 3]
+    if not mots:
+        return 0.0
+
+    hits = [mot for mot in mots if mot in COMMON_WORDS]
+    nb_hits = len(hits)
+    nb_uniques = len(set(hits))
+    plus_long = max((len(mot) for mot in hits), default=0)
+    ratio_hits = nb_hits / len(mots)
+    return ratio_hits * 260.0 + min(nb_hits, 15) * 7.0 + min(nb_uniques, 8) * 5.0 + plus_long * 1.5
+
+def _dechiffrement_depuis_indices(indices, texte_source, a_inv, b):
+    """Déchiffrement rapide à partir d'indices pré-calculés."""
+    resultat = []
+    for char, y in zip(texte_source, indices):
+        if y is None:
+            resultat.append(char)
+        else:
+            resultat.append(ALPHABET[(a_inv * (y - b)) % N])
+    return ''.join(resultat)
+
+def _chunks(sequence, taille):
+    for i in range(0, len(sequence), taille):
+        yield sequence[i:i + taille]
+
+def _worker_rainbow(chunk_cles, echantillon_texte, echantillon_indices):
+    """Worker: construit des stats de table arc-en-ciel sur un sous-ensemble de clés."""
+    local_entries = []
+    for a, b in chunk_cles:
+        texte_test = _dechiffrement_depuis_indices(echantillon_indices, echantillon_texte, A_INVERSES[a], b)
+        score_stats = _score_texte_universel(texte_test)
+        score_dict = _score_dictionnaire(texte_test)
+        local_entries.append((a, b, score_stats, score_dict))
+    return local_entries
+
+def _construire_table_arc_en_ciel(texte_code, taille_echantillon):
+    """Construit/cache une table arc-en-ciel simplifiée (clé -> scores d'empreinte)."""
+    signature = texte_code[:taille_echantillon]
+    cache_key = (signature, taille_echantillon)
+    if cache_key in RAINBOW_CACHE:
+        return RAINBOW_CACHE[cache_key]
+
+    echantillon_texte = signature
+    echantillon_indices = [CHAR_TO_INDEX.get(char) for char in echantillon_texte]
+
+    nb_workers = max(1, min(MAX_WORKERS, len(KEY_SPACE)))
+    taille_bloc = max(1, len(KEY_SPACE) // nb_workers)
+
+    table = {}
+    with ThreadPoolExecutor(max_workers=nb_workers) as executor:
+        futures = [
+            executor.submit(_worker_rainbow, chunk, echantillon_texte, echantillon_indices)
+            for chunk in _chunks(KEY_SPACE, taille_bloc)
+        ]
+        for future in futures:
+            for a, b, score_stats, score_dict in future.result():
+                table[(a, b)] = (score_stats, score_dict)
+
+    if len(RAINBOW_CACHE) > 8:
+        RAINBOW_CACHE.pop(next(iter(RAINBOW_CACHE)))
+    RAINBOW_CACHE[cache_key] = table
+    return table
+
+def _worker_evaluer_cles(chunk_cles, texte_code, indices):
+    """Worker: évalue les clés candidates sur le texte complet."""
     resultats = []
-    
-    for a in range(1, N):
-        if math.gcd(a, N) == 1:
-            for b in range(N):
-                test = dechiffrement(texte_code, a, b)
-                if test and any(mot in test.lower() for mot in mots_cles):
-                    resultats.append((a, b, test))
-                    if len(resultats) >= 10:  # Limite à 10 résultats
-                        return resultats
+    for a, b in chunk_cles:
+        texte_dechiffre = _dechiffrement_depuis_indices(indices, texte_code, A_INVERSES[a], b)
+        score = _score_texte_universel(texte_dechiffre) + 1.6 * _score_dictionnaire(texte_dechiffre)
+        resultats.append((score, a, b, texte_dechiffre))
     return resultats
+
+def cryptanalyse_brute_force(texte_code, callback=None, max_resultats=10):
+    """Cryptanalyse hybride: dictionnaire + table arc-en-ciel + calcul parallèle."""
+    if not texte_code:
+        return []
+
+    indices = [CHAR_TO_INDEX.get(char) for char in texte_code]
+    taille_echantillon = min(len(texte_code), 120)
+
+    rainbow_table = _construire_table_arc_en_ciel(texte_code, taille_echantillon)
+
+    if callback:
+        callback("Table arc-en-ciel prête.")
+
+    preselection = []
+    for (a, b), (score_stats, score_dict) in rainbow_table.items():
+        score_pre = score_stats + 2.2 * score_dict
+        preselection.append((score_pre, a, b))
+
+    nb_candidats = len(preselection)
+    meilleurs_candidats = heapq.nlargest(nb_candidats, preselection, key=lambda x: x[0])
+    cles_candidates = [(a, b) for _, a, b in meilleurs_candidats]
+
+    if callback:
+        callback(f"{len(cles_candidates)} clés candidates à tester.")
+
+    nb_workers = max(1, min(MAX_WORKERS, len(cles_candidates)))
+    taille_bloc = max(1, len(cles_candidates) // nb_workers)
+
+    resultats = []
+    with ThreadPoolExecutor(max_workers=nb_workers) as executor:
+        futures = [
+            executor.submit(_worker_evaluer_cles, chunk, texte_code, indices)
+            for chunk in _chunks(cles_candidates, taille_bloc)
+        ]
+        for future in futures:
+            resultats.extend(future.result())
+
+    if callback:
+        callback("Évaluation finale terminée.")
+
+    meilleurs = heapq.nlargest(max_resultats, resultats, key=lambda x: x[0])
+    return [(a, b, texte, score) for score, a, b, texte in meilleurs]
 
 # --- INTERFACE GRAPHIQUE ---
 
@@ -243,13 +403,13 @@ class CryptApp:
         self.result_cryptanalyse.insert("1.0", "Analyse en cours...\n\n")
         self.root.update()
         
-        resultats = cryptanalyse_brute_force(texte, None)
+        resultats = cryptanalyse_brute_force(texte)
         
         self.result_cryptanalyse.delete("1.0", tk.END)
         if resultats:
-            for i, (a, b, texte_dechiffre) in enumerate(resultats, 1):
+            for i, (a, b, texte_dechiffre, score) in enumerate(resultats, 1):
                 self.result_cryptanalyse.insert(tk.END, f"--- Résultat {i} ---\n")
-                self.result_cryptanalyse.insert(tk.END, f"Clé : a={a}, b={b}\n")
+                self.result_cryptanalyse.insert(tk.END, f"Clé : a={a}, b={b} (score={score:.2f})\n")
                 self.result_cryptanalyse.insert(tk.END, f"Texte : {texte_dechiffre[:150]}...\n\n")
         else:
             self.result_cryptanalyse.insert("1.0", "Aucun résultat probant trouvé.")
